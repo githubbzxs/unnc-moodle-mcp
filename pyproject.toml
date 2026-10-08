@@ -1,0 +1,32 @@
+[project]
+name = "unnc-moodle-mcp"
+version = "0.1.0"
+description = "宁波诺丁汉大学（UNNC）Moodle 只读 MCP：课程信息查询与课件增量下载"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=2.3,<3",
+    "playwright>=1.63.0",
+    "pypdf>=6.19.0",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+]
+
+[project.scripts]
+unnc-moodle-mcp = "unnc_moodle_mcp.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_mode = "auto"
