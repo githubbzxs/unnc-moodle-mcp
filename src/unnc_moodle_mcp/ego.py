@@ -14,6 +14,7 @@ _RESULT = "UNNC_MOODLE_RESULT:"
 _SCRIPT = r"""
 let task;
 let result;
+let cleanupAllowed = true;
 try {
     task = await taskSpace(opts.spaceId ?? "UNNC Moodle MCP：读取课程分页");
     const page = task.page("p1");
@@ -51,9 +52,10 @@ try {
         }, {ids: opts.cmids, userid: opts.userid});
     }
 } catch (error) {
-    result = {error: "browser_error", kind: error.name};
+    cleanupAllowed = !/control|ownership|inactive|unassigned|permission|executionStopped/i.test(`${error.name} ${error.message}`);
+    result = {error: cleanupAllowed ? "browser_error" : "user_control", kind: error.name};
 } finally {
-    if (task && opts.spaceId === null) {
+    if (task && opts.spaceId === null && cleanupAllowed) {
         try { await task.finish({keep: []}); } catch { result = {error: "cleanup_failed"}; }
     }
 }
@@ -132,6 +134,8 @@ class EgoReader:
             raise EgoUnavailable("Ego 缺少学校登录态；请在 Chrome 登录并同步后重试，Moodle token 与网页登录态独立。")
         if data.get("error") == "wrong_account":
             raise EgoUnavailable("Ego 与 Moodle MCP 登录的不是同一学生账号，已拒绝混用课程内容。")
+        if data.get("error") == "user_control":
+            raise EgoUnavailable("Ego 控制权已转交或任务已停止，未继续操作浏览器。")
         if data.get("error"):
             raise EgoUnavailable("Ego 未完成课程页读取，不能据此判断课件未上传。")
         if not isinstance(data.get("modules"), list):

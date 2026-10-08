@@ -251,6 +251,23 @@ async def test_ego_fails_closed_on_wrong_account(monkeypatch):
         await reader.read_course(7, [30])
 
 
+async def test_ego_stops_without_login_sync_when_user_takes_control(monkeypatch):
+    from unnc_moodle_mcp.ego import EgoReader, EgoUnavailable
+
+    reader = EgoReader(42)
+
+    async def run(*_):
+        return {"error": "user_control"}
+
+    async def no_sync():
+        pytest.fail("控制权转交后不能重试或同步登录态")
+
+    monkeypatch.setattr(reader, "_run", run)
+    monkeypatch.setattr(reader, "_sync_login", no_sync)
+    with pytest.raises(EgoUnavailable, match="未继续操作"):
+        await reader.read_course(7, [30])
+
+
 async def test_ego_login_sync_retries_only_once(monkeypatch):
     from unnc_moodle_mcp.ego import EgoReader
 
