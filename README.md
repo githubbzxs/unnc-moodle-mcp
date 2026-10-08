@@ -5,7 +5,7 @@
 ## 工作原理
 
 - **登录**：与官方 Moodle App 相同的 SSO 流程。`login` 打开一个独立的 Chrome 窗口 → 自动点击「Student and staff sign in」→ 你完成微软登录 → Moodle 回调 `moodlemobile://token=…` → 校验 passport 后保存移动端 Web Service token。不需要密码，也不读取浏览器 Cookie。
-- **数据**：所有查询都走 Moodle 官方 REST Web Service（与 App 同一套接口），不抓网页。
+- **数据**：课程、公告、作业等优先走 Moodle 官方 REST Web Service（与 App 同一套接口）。`tabbedcontent` 分页活动先调用插件的官方移动端接口；接口不可用时，通过 EgoLite 已登录的课程页读取全部分页正文，不只读取当前选中的分页。
 - **下载**：文件经 `webservice/pluginfile.php` 下载，token 只放在 POST 请求体中，不出现在 URL、日志或返回给 AI 的文本里；只允许下载本站文件。
 - **只读**：不提交作业、不发帖、不标记已读、不修改任何 Moodle 数据。
 
@@ -40,9 +40,9 @@ args = ["run", "--directory", "/Users/<你>/Desktop/Academic/moodle-mcp", "unnc-
 | --- | --- |
 | `login` / `whoami` | 浏览器 SSO 登录；查看当前账号 |
 | `list_courses` | 已选课程（本学期 / 过去 / 全部 / 隐藏） |
-| `course_outline` | 一门课的章节与活动，含 cmid、文件名、大小、更新时间、截止时间 |
-| `find_materials` | 按关键词在活动名和文件名中搜索（如 `week 3 lecture`） |
-| `read_activity` | 读取页面、书、链接、作业要求等活动正文 |
+| `course_outline` | 一门课的章节与活动，含 cmid、文件名、大小、更新时间、截止时间与分页内容入口 |
+| `find_materials` | 按关键词在活动名、文件名及分页正文中搜索（如 `week 3 lecture`） |
+| `read_activity` | 读取页面、书、分页内容、链接、作业要求等活动正文；未支持的类型明确提示读取不完整 |
 | `upcoming_deadlines` | 未来 N 天待办（与 Moodle 时间线一致） |
 | `list_assignments` | 作业、截止时间、提交与评分状态 |
 | `announcements` | 课程公告最新帖子与正文 |
@@ -77,7 +77,20 @@ uv run unnc-moodle-mcp sync --dry-run             # 只看会下载什么
 - 不指定课程时只同步带课程代码的正式课程（如 DSEEF011、CELEN048）；Academic Services Office、FoSE、Writing Lab 等学院/机构页面文件很多（ASO 有 6000+ 个考试反馈文件），需要时单独指定课程名同步。
 - 「本学期」包含 Moodle 归为进行中的课程，以及结束日期在 120 天内的课程（Foundation Physics 的结束日期被设成了开学第三周，会被 Moodle 误归为过去课程）。
 - Moodle 5.x 的子章节（subsection）放在父章节下的子目录里。
-- 默认同步 `resource`（文件）和 `folder`（文件夹）活动；页面、作业附件等用 `download_activity` 按需下载。
+- 默认同步 `resource`（文件）、`folder`（文件夹）和 `tabbedcontent`（分页正文里的本站文件链接）；分页文件保存在活动名/分页名子目录下。页面、作业附件等用 `download_activity` 按需下载。
+- 分页链接没有文件元数据时，从文件响应头补齐大小和更新时间；元数据缺失或获取失败时明确提示，下次同步重新核验，不把未知值当成未变化。文件重定向也必须留在本站，避免把 POST token 转发到外站。
+
+## 分页内容与读取完整性
+
+一些课程把每周 Lecture/Seminar 正文和 slides 链接放在 `tabbedcontent` 插件中，标准课程文件列表并不包含它们。本服务的大纲、搜索、读取和下载共用分页内容解析：
+
+1. 尝试插件注册的官方移动端内容接口，完整返回时无需浏览器。
+2. 若接口缺失、报错或返回的分页结构不完整，调用本机 `ego-browser`，在课程页中读取所有分页及未选中分页的正文和链接；会核对网页学生账号与 MCP token 的账号一致，不混用两个账号的课程内容。
+3. 若 Ego 未安装、未登录、页面结构改变，或存在未读取的嵌入页面，明确返回 `〔读取不完整〕`。搜索未命中和下载列表为空都不能据此解释为老师未上传。
+
+网页回退需要本机安装 EgoLite，并具有该学校账号的网页登录态；只用普通官方 API 的查询不受影响。Moodle token 登录与网页登录态互相独立。Codex 环境若已安装 `ego-login-sync`，遇到登录墙会最多尝试一次 Chrome 登录态同步；该同步会重启 Ego，脚本检测到其他任务占用时不会强制执行。同步后仍未登录时，在 Chrome 登录学校账号后重试。
+
+分页正文缓存最多 5 分钟，不完整结果缓存 1 分钟；文件链接中的认证查询参数会移除，浏览器原始日志和完整课程页不会写入下载目录或 MCP 响应。只下载本站 `pluginfile.php` 文件，不自动访问正文中的外站链接。
 
 ## 登录备选：复用 Chrome 登录态
 
@@ -103,7 +116,7 @@ uv run unnc-moodle-mcp sync --dry-run             # 只看会下载什么
 uv run pytest
 ```
 
-测试使用模拟的 Moodle 接口，覆盖 SSO 回调校验、token 不进 URL、跨站下载拦截、增量同步、不覆盖用户文件、失败重试、课程模糊匹配、PPTX/DOCX 抽取等。
+测试使用模拟的 Moodle 接口，覆盖 SSO 回调校验、token 不进 URL、跨站下载与重定向拦截、增量同步、不覆盖用户文件、失败重试、课程模糊匹配、分页 API 与网页回退、未选中分页读取、搜索完整性提示、账号核对、PPTX/DOCX 抽取等。
 
 ## 参考
 
