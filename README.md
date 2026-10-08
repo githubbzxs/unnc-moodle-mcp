@@ -66,7 +66,7 @@ args = ["run", "--directory", "/Users/<你>/Desktop/Academic/moodle-mcp", "unnc-
 ## 课件同步
 
 ```sh
-uv run unnc-moodle-mcp sync                       # 本学期全部课程
+uv run unnc-moodle-mcp sync                       # 本学期全部正式课程
 uv run unnc-moodle-mcp sync physics --types pptx,pdf
 uv run unnc-moodle-mcp sync --dry-run             # 只看会下载什么
 ```
@@ -74,7 +74,16 @@ uv run unnc-moodle-mcp sync --dry-run             # 只看会下载什么
 - 保存到 `~/Desktop/Academic/Moodle/<课程全名>/<序号 章节名>/<文件>`；文件夹活动或多文件资源再多一层活动名目录。
 - 每门课目录下的 `.moodle-sync.json` 记录已同步文件的修改时间和大小；再次同步只下载新增或老师更新过的文件，文件修改时间设为 Moodle 上的时间。
 - 目标位置已有**内容不同**的同名文件（例如你自己的批注版）时，不会覆盖，新文件保存为 `名称 (Moodle).ext`；同名同大小的文件直接登记为已同步。
+- 不指定课程时只同步带课程代码的正式课程（如 DSEEF011、CELEN048）；Academic Services Office、FoSE、Writing Lab 等学院/机构页面文件很多（ASO 有 6000+ 个考试反馈文件），需要时单独指定课程名同步。
+- 「本学期」包含 Moodle 归为进行中的课程，以及结束日期在 120 天内的课程（Foundation Physics 的结束日期被设成了开学第三周，会被 Moodle 误归为过去课程）。
+- Moodle 5.x 的子章节（subsection）放在父章节下的子目录里。
 - 默认同步 `resource`（文件）和 `folder`（文件夹）活动；页面、作业附件等用 `download_activity` 按需下载。
+
+## 登录备选：复用 Chrome 登录态
+
+`login` 弹出的是独立 Chrome 配置，不共享日常 Chrome 的登录。若日常 Chrome 已登录学校账号，可以让 AI 用 Ego 浏览器（先同步 Chrome 登录态）打开
+`admin/tool/mobile/launch.php?service=moodle_mobile_app&passport=<随机串>&urlscheme=moodlemobile`，在微软账号选择页选学校账号，截获
+`moodlemobile://token=…` 回调后用 `auth.decode_app_token` 校验并 `auth.save_session` 保存。
 
 ## 本地文件与配置
 

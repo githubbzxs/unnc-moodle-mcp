@@ -6,6 +6,7 @@ token 只放在 POST 表单里，不拼进 URL，错误信息里也只展示不�
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -18,6 +19,7 @@ import httpx
 from .config import MOODLE_URL, USER_AGENT
 
 REST_URL = f"{MOODLE_URL}/webservice/rest/server.php"
+RETRIES = 2
 
 
 class MoodleError(Exception):
@@ -103,11 +105,22 @@ class MoodleClient:
         }
         for key, value in args.items():
             _flatten(key, value, form)
-        try:
-            resp = await self._http.post(REST_URL, data=form)
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise MoodleError("http", f"调用 {function} 失败：{type(exc).__name__}") from None
+        for attempt in range(RETRIES + 1):
+            try:
+                resp = await self._http.post(REST_URL, data=form)
+                if resp.status_code >= 500 and attempt < RETRIES:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                resp.raise_for_status()
+                break
+            except httpx.TransportError as exc:
+                # 服务器关闭空闲连接、网络抖动等，查询是只读的，可安全重试
+                if attempt < RETRIES:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                raise MoodleError("http", f"调用 {function} 失败：{type(exc).__name__}") from None
+            except httpx.HTTPError as exc:
+                raise MoodleError("http", f"调用 {function} 失败：{type(exc).__name__}") from None
         try:
             data = resp.json()
         except ValueError:

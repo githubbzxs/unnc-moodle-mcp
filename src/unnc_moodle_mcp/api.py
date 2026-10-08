@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,10 @@ TTL_COURSES = 3600
 TTL_CONTENTS = 600
 TTL_ACTIVITY = 300
 TTL_LIVE = 60
+# 结束日期在这么多天内的 past 课程仍视为本学期课程
+RECENT_PAST_DAYS = 120
+# UNNC 正式课程简称以课程代码开头；NONE-/FOSE-/CELE- 等是学院或机构页面
+MODULE_CODE = re.compile(r"^[A-Z]{4,6}\d{3,4}[A-Z]?-")
 
 
 @dataclass(frozen=True)
@@ -32,9 +37,40 @@ class Course:
     def label(self) -> str:
         return f"{self.fullname}（id={self.id}）"
 
+    @property
+    def is_module(self) -> bool:
+        """是否为带课程代码的正式课程（如 DSEEF011-1-UNNC-AUC-2627），而非学院/机构页面。"""
+        return bool(MODULE_CODE.match(self.shortname))
+
 
 class CourseNotFound(LookupError):
     pass
+
+
+def section_tree(sections: list[dict]) -> list[tuple[dict, list[tuple[dict, dict | None]]]]:
+    """整理 Moodle 5.x 的子章节（mod_subsection）。
+
+    子章节在 core_course_get_contents 里既是父章节中的一个 subsection 模块，
+    又作为独立章节排在末尾。这里只返回顶层章节，每个模块附带它展开的子章节（若有）。
+    """
+    delegated = {
+        str(s.get("id")): s for s in sections if s.get("component") == "mod_subsection"
+    }
+    tree = []
+    for section in sections:
+        if section.get("component") == "mod_subsection":
+            continue
+        modules: list[tuple[dict, dict | None]] = []
+        for module in section.get("modules", []):
+            child = None
+            if module.get("modname") == "subsection":
+                try:
+                    child = delegated.get(str(json.loads(module.get("customdata") or "{}").get("sectionid")))
+                except ValueError:
+                    child = None
+            modules.append((module, child))
+        tree.append((section, modules))
+    return tree
 
 
 class Moodle:
@@ -62,6 +98,22 @@ class Moodle:
         self._cache.clear()
 
     # ---------- 课程 ----------
+
+    async def current_courses(self) -> list[Course]:
+        """本学期课程：Moodle 的 inprogress，加上近期被归为 past 的课程。
+
+        有的老师把课程结束日期设得过早（如 Foundation Physics 结束于开学第三周），
+        已完成的课程也会被 Moodle 归入 past，这些课仍需要查看和同步。
+        """
+        now = time.time()
+        current = await self.courses("inprogress")
+        seen = {c.id for c in current}
+        for c in await self.courses("past"):
+            recent_end = c.enddate and c.enddate >= now - RECENT_PAST_DAYS * 86400
+            recent_start = c.startdate and c.startdate >= now - 300 * 86400
+            if c.id not in seen and (recent_end or recent_start):
+                current.append(c)
+        return sorted(current, key=lambda c: c.fullname.lower())
 
     async def courses(self, classification: str = "inprogress") -> list[Course]:
         data = await self.call(
@@ -101,7 +153,7 @@ class Moodle:
         hits = [c for c in pool if needle in c.fullname.lower() or needle in c.shortname.lower()]
         if len(hits) > 1:
             # 同名课程跨学期时优先当前学期
-            current = {c.id for c in await self.courses("inprogress")}
+            current = {c.id for c in await self.current_courses()}
             active = [c for c in hits if c.id in current]
             if len(active) == 1:
                 return active[0]

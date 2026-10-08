@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .api import Course, Moodle
+from .api import Course, Moodle, section_tree
 from .config import DOWNLOAD_DIR
 from .textutil import fmt_size, safe_name
 
@@ -88,46 +89,58 @@ def plan_files(
     exts: set[str] | None = None,
     modules: set[str] = SYNC_MODULES,
 ) -> list[RemoteFile]:
-    """从 core_course_get_contents 的结果列出要同步的文件及其本地相对路径。"""
+    """从 core_course_get_contents 的结果列出要同步的文件及其本地相对路径。
+
+    子章节（Moodle 5.x 的 mod_subsection）里的文件放在父章节下的子目录中。
+    """
     files: list[RemoteFile] = []
     taken: set[str] = set()
-    for index, section in enumerate(sections):
-        section_name = (section.get("name") or "").strip() or f"Section {index}"
-        section_dir = Path(safe_name(f"{index:02d} {section_name}"))
-        for module in section.get("modules", []):
-            modname = module.get("modname", "")
-            if modname not in modules or not module.get("uservisible", True):
+
+    def add(module: dict, section_dir: Path, section_name: str) -> None:
+        modname = module.get("modname", "")
+        if modname not in modules or not module.get("uservisible", True):
+            return
+        items = [c for c in module.get("contents") or [] if c.get("type") == "file"]
+        base = section_dir
+        if modname == "folder" or len(items) > 1:
+            base = section_dir / safe_name(html.unescape(module.get("name") or "folder"))
+        for item in items:
+            name = item.get("filename") or ""
+            url = item.get("fileurl") or ""
+            if not name or not url or not _match_ext(name, exts):
                 continue
-            items = [c for c in module.get("contents") or [] if c.get("type") == "file"]
-            base = section_dir
-            if modname == "folder" or len(items) > 1:
-                base = section_dir / safe_name(module.get("name") or "folder")
-            for item in items:
-                name = item.get("filename") or ""
-                url = item.get("fileurl") or ""
-                if not name or not url or not _match_ext(name, exts):
-                    continue
-                sub = [safe_name(p) for p in (item.get("filepath") or "/").strip("/").split("/") if p]
-                rel = base.joinpath(*sub, safe_name(name))
-                # 同目录下重名时追加序号
-                stem, suffix, n = rel.stem, rel.suffix, 2
-                while rel.as_posix().lower() in taken:
-                    rel = rel.with_name(f"{stem} ({n}){suffix}")
-                    n += 1
-                taken.add(rel.as_posix().lower())
-                files.append(
-                    RemoteFile(
-                        # 资源文件 URL 里含版本号，替换文件后会变；用 cmid+路径+文件名作稳定键
-                        key=f"{module.get('id')}:{item.get('filepath') or '/'}{name}",
-                        url=url,
-                        rel=rel,
-                        size=int(item.get("filesize") or 0),
-                        modified=int(item.get("timemodified") or 0),
-                        section=section_name,
-                        module=module.get("name") or "",
-                        cmid=int(module.get("id") or 0),
-                    )
+            sub = [safe_name(p) for p in (item.get("filepath") or "/").strip("/").split("/") if p]
+            rel = base.joinpath(*sub, safe_name(name))
+            # 同目录下重名时追加序号
+            stem, suffix, n = rel.stem, rel.suffix, 2
+            while rel.as_posix().lower() in taken:
+                rel = rel.with_name(f"{stem} ({n}){suffix}")
+                n += 1
+            taken.add(rel.as_posix().lower())
+            files.append(
+                RemoteFile(
+                    # 资源文件 URL 里含版本号，替换文件后会变；用 cmid+路径+文件名作稳定键
+                    key=f"{module.get('id')}:{item.get('filepath') or '/'}{name}",
+                    url=url,
+                    rel=rel,
+                    size=int(item.get("filesize") or 0),
+                    modified=int(item.get("timemodified") or 0),
+                    section=section_name,
+                    module=html.unescape(module.get("name") or ""),
+                    cmid=int(module.get("id") or 0),
                 )
+            )
+
+    for index, (section, entries) in enumerate(section_tree(sections)):
+        section_name = html.unescape(section.get("name") or "").strip() or f"Section {index}"
+        section_dir = Path(safe_name(f"{index:02d} {section_name}"))
+        for module, child in entries:
+            if child is None:
+                add(module, section_dir, section_name)
+                continue
+            child_name = html.unescape(child.get("name") or module.get("name") or "").strip()
+            for sub_module in child.get("modules", []):
+                add(sub_module, section_dir / safe_name(child_name or "subsection"), section_name)
     return files
 
 
@@ -186,7 +199,7 @@ async def sync_course(
     if only_cmid is None:
         remote = plan_files(sections, exts)
     else:
-        every = {m.get("modname", "") for s in sections for m in s.get("modules", [])}
+        every = {m.get("modname", "") for sec in sections for m in sec.get("modules", [])}
         remote = [f for f in plan_files(sections, exts, every) if f.cmid == only_cmid]
     manifest = load_manifest(root)
     owned = {e.get("path", "") for e in manifest.values()}

@@ -15,7 +15,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import auth
-from .api import Course, CourseNotFound, Moodle
+from .api import Course, CourseNotFound, Moodle, section_tree
 from .client import MoodleClient, MoodleError, TokenInvalid
 from .config import DOWNLOAD_DIR, MOODLE_URL
 from .extract import extract_text
@@ -69,7 +69,7 @@ def errors() -> Iterator[None]:
 async def _courses_for(moodle: Moodle, course: str | None) -> list[Course]:
     if course:
         return [await moodle.resolve_course(course)]
-    return await moodle.courses("inprogress")
+    return await moodle.current_courses()
 
 
 # ---------------------------------------------------------------- 登录
@@ -171,22 +171,30 @@ async def course_outline(course: str, include_summaries: bool = False) -> str:
         moodle = await get_moodle()
         c = await moodle.resolve_course(course)
         lines = [f"# {c.fullname}（id={c.id}）", c.url]
-        for index, section in enumerate(await moodle.contents(c.id)):
-            modules = section.get("modules", [])
+
+        def emit(m: dict, indent: str) -> None:
+            if m.get("modname") == "label":
+                if include_summaries:
+                    text = html_to_text(m.get("description"))
+                    if text:
+                        lines.append(f"{indent}  〔标签〕{clip(text, 800)}")
+                return
+            lines.append(indent + _module_line(m))
+
+        for index, (section, entries) in enumerate(section_tree(await moodle.contents(c.id))):
             summary = html_to_text(section.get("summary")) if include_summaries else ""
-            if not modules and not summary:
+            if not entries and not summary:
                 continue
             lines.append(f"\n## {index:02d} {html.unescape(section.get('name') or '')}")
             if summary:
                 lines.append(clip(summary, 1500))
-            for m in modules:
-                if m.get("modname") == "label":
-                    if include_summaries:
-                        text = html_to_text(m.get("description"))
-                        if text:
-                            lines.append(f"  〔标签〕{clip(text, 800)}")
+            for m, child in entries:
+                if child is None:
+                    emit(m, "")
                     continue
-                lines.append(_module_line(m))
+                lines.append(f"- [子章节] {html.unescape(child.get('name') or m.get('name') or '')}")
+                for sub in child.get("modules", []):
+                    emit(sub, "  ")
         return clip("\n".join(lines), 80_000)
 
 
@@ -209,12 +217,15 @@ async def find_materials(keyword: str, course: str | None = None) -> str:
         for c, sections in zip(courses, all_contents, strict=True):
             for section in sections:
                 for m in section.get("modules", []):
-                    names = [m.get("name") or ""] + [
+                    if m.get("modname") in ("subsection", "label"):
+                        continue
+                    names = [html.unescape(m.get("name") or "")] + [
                         f.get("filename") or "" for f in m.get("contents") or [] if f.get("type") == "file"
                     ]
-                    hay = " ".join(names + [section.get("name") or ""]).lower()
+                    where = html.unescape(section.get("name") or "")
+                    hay = " ".join(names + [where]).lower()
                     if all(w in hay for w in words):
-                        hits.append(f"{c.shortname}｜{html.unescape(section.get('name') or '')}\n  {_module_line(m)}")
+                        hits.append(f"{c.shortname}｜{where}\n  {_module_line(m)}")
         if not hits:
             return f"没有找到包含「{keyword}」的活动或文件。"
         return clip(f"找到 {len(hits)} 项：\n" + "\n".join(hits), 40_000)
@@ -287,7 +298,8 @@ async def read_activity(cmid: int, max_chars: int = 30_000) -> str:
                 lines.append(_assign_dates(a))
                 status = await _assign_status(moodle, a)
                 lines.append(f"提交状态：{status}")
-                lines.append(f"\n## 作业要求\n{html_to_text(a.get('intro'))}")
+                intro = html_to_text(a.get("intro"))
+                lines.append(f"\n## 作业要求\n{intro}" if intro else "\n（作业页面没有填写说明文字）")
                 act = html_to_text(a.get("activity"))
                 if act:
                     lines.append(f"\n## 提交说明\n{act}")
@@ -328,8 +340,12 @@ async def _assign_status(moodle: Moodle, a: dict) -> str:
     except MoodleError as exc:
         return f"无法获取（{exc.errorcode}）"
     last = data.get("lastattempt") or {}
-    sub = last.get("submission") or (last.get("teamsubmission") or {})
-    status = _SUBMISSION.get(sub.get("status", ""), sub.get("status") or "未知")
+    sub = last.get("submission") or last.get("teamsubmission") or {}
+    opens = a.get("allowsubmissionsfromdate") or 0
+    if sub.get("status") in (None, "", "new") and opens > time.time():
+        status = "尚未开放"
+    else:
+        status = _SUBMISSION.get(sub.get("status", ""), sub.get("status") or "未提交")
     parts = [status]
     grading = _GRADING.get(last.get("gradingstatus", ""))
     if grading:
@@ -569,13 +585,17 @@ async def sync_files(course: str | None = None, types: str | None = None, dry_ru
     保存位置：<下载根目录>/<课程名>/<序号 章节名>/<文件>。
 
     Args:
-        course: 课程 id 或名称关键词；默认同步本学期全部课程
+        course: 课程 id 或名称关键词；默认同步本学期全部正式课程（带课程代码的，
+            不含 Academic Services Office、FoSE 等学院/机构页面，这些需单独指定）
         types: 只同步这些扩展名，逗号分隔，如 "pptx,pdf"；默认全部
         dry_run: 只列出将要下载的文件，不实际下载
     """
     with errors():
         moodle = await get_moodle()
-        courses = await _courses_for(moodle, course)
+        if course:
+            courses = [await moodle.resolve_course(course)]
+        else:
+            courses = [c for c in await moodle.current_courses() if c.is_module]
         exts = _parse_types(types)
         reports = []
         for c in courses:

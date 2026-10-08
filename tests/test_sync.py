@@ -136,3 +136,51 @@ async def test_only_cmid_includes_page_attachments(fake, moodle, downloads):
     fake.set_contents(_sections())
     report = await sync_course(moodle, _course(), only_cmid=23)
     assert [p.name for p in report.local_paths()] == ["index.html"]
+
+
+async def test_subsections_are_nested_once(fake, moodle, downloads):
+    from unnc_moodle_mcp.sync import plan_files
+
+    fake.set_contents([
+        {"id": 1, "name": "Submission Dropbox", "modules": [
+            {"id": 50, "name": "Report", "modname": "subsection", "customdata": '{"sectionid":"9"}'},
+        ]},
+        {"id": 9, "name": "Report", "component": "mod_subsection", "modules": [
+            {"id": 51, "name": "Template", "modname": "resource",
+             "contents": [file_item("Template.docx", b"T" * 5, 1, cmid=51)]},
+        ]},
+    ])
+    files = plan_files(fake.responses["core_course_get_contents"])
+    assert [f.rel.as_posix() for f in files] == ["00 Submission Dropbox/Report/Template.docx"]
+
+
+async def test_current_courses_include_recently_ended(fake, moodle):
+    import time
+
+    now = int(time.time())
+
+    def by_class(form):
+        cls = form["classification"][0]
+        return {"courses": {
+            "inprogress": [{"id": 1, "fullname": "Maths", "shortname": "M", "startdate": now - 30 * 86400, "enddate": now + 90 * 86400}],
+            "past": [
+                {"id": 2, "fullname": "Physics", "shortname": "P", "startdate": now - 20 * 86400, "enddate": now - 3 * 86400},
+                {"id": 3, "fullname": "Old", "shortname": "O", "startdate": now - 900 * 86400, "enddate": now - 700 * 86400},
+            ],
+        }.get(cls, [])}
+
+    fake.responses["core_course_get_enrolled_courses_by_timeline_classification"] = by_class
+    assert [c.id for c in await moodle.current_courses()] == [1, 2]
+
+
+def test_module_course_detection():
+    from unnc_moodle_mcp.api import Course
+
+    def c(short):
+        return Course(1, "x", short, "", 0, 0, "")
+
+    assert c("DSEEF011-1-UNNC-AUC-2627").is_module
+    assert c("CELEN069-1-UNNC-AUC-2627").is_module
+    assert not c("NONE-ASO-UNNC").is_module
+    assert not c("FOSE-PRELIMINARYY-UNNC-2627").is_module
+    assert not c("CELE-CELECS-UNNC-2627").is_module

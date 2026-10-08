@@ -62,3 +62,25 @@ async def test_download_is_atomic_and_reports_moodle_errors(fake, tmp_path):
             await c.download(f"{BASE}/pluginfile.php/1/x/y/a.pdf", tmp_path / "b.pdf")
         assert "invalidtoken" in str(exc.value)
     assert not (tmp_path / "b.pdf").exists()
+
+
+async def test_call_retries_dropped_connections(fake, monkeypatch):
+    import unnc_moodle_mcp.client as client_mod
+    from unnc_moodle_mcp.client import MoodleClient
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(client_mod.asyncio, "sleep", no_sleep)
+    fake.responses["core_webservice_get_site_info"] = {"userid": 1}
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.RemoteProtocolError("Server disconnected")
+        return fake.handler(request)
+
+    async with MoodleClient(TOKEN, transport=httpx.MockTransport(flaky)) as c:
+        assert await c.call("core_webservice_get_site_info") == {"userid": 1}
+    assert calls["n"] == 2
