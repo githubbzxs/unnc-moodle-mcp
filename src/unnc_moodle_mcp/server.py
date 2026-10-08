@@ -20,6 +20,7 @@ from .client import MoodleClient, MoodleError, TokenInvalid
 from .config import DOWNLOAD_DIR, MOODLE_URL
 from .extract import extract_text
 from .sync import course_dir, sync_course
+from .tabbed import TabbedContent
 from .textutil import clip, fmt_size, fmt_time, html_to_text, safe_name
 
 INSTRUCTIONS = f"""本服务以当前登录学生的身份只读访问宁波诺丁汉大学 Moodle（{MOODLE_URL}）。
@@ -27,6 +28,8 @@ INSTRUCTIONS = f"""本服务以当前登录学生的身份只读访问宁波诺�
 - 任何工具提示未登录时，调用 login 一次：会弹出 Chrome 窗口，用户完成学校微软登录后自动保存 token。
 - 参数 course 可以填课程 id，也可以填课程名称或简称中的关键词。
 - 先用 list_courses / course_outline 找到活动的 cmid，再用 read_activity 读正文、download_activity 下载文件。
+- tabbedcontent 会读取所有分页（含未选中的分页）；官方插件 API 故障时经 Ego 已登录课程页回退。
+- 若输出提示“读取不完整”，未找到课件不能解释为老师未上传；请先恢复读取能力。
 - 批量下载课件用 sync_files，文件保存在 {DOWNLOAD_DIR}/<课程>/<章节>/，只下载新增或更新的文件。
 - PPT/PDF/Word 的文字用 read_local_file 读取。
 - 所有时间均为 UTC+8。本服务不提交作业、不发帖、不修改任何 Moodle 数据。
@@ -143,13 +146,15 @@ def _module_line(m: dict) -> str:
     if not m.get("uservisible", True):
         parts.append("〔暂不可访问〕")
     files = [c for c in m.get("contents") or [] if c.get("type") == "file"]
-    if m.get("modname") in ("resource", "folder") and files:
+    if m.get("modname") in ("resource", "folder", "tabbedcontent") and files:
         if len(files) == 1:
             f = files[0]
-            parts.append(f"— {f.get('filename')}，{fmt_size(f.get('filesize'))}，更新于 {fmt_time(f.get('timemodified'))}")
+            size = fmt_size(f["filesize"]) if "filesize" in f else "大小未知"
+            modified = fmt_time(f["timemodified"]) if "timemodified" in f else "未知"
+            parts.append(f"— {f.get('filename')}，{size}，更新于 {modified}")
         else:
-            total = sum(int(f.get("filesize") or 0) for f in files)
-            parts.append(f"— {len(files)} 个文件，共 {fmt_size(total)}")
+            size = fmt_size(sum(int(f["filesize"]) for f in files)) if all("filesize" in f for f in files) else "大小未知"
+            parts.append(f"— {len(files)} 个文件，共 {size}")
     if m.get("modname") == "url":
         link = next((c.get("fileurl") for c in m.get("contents") or [] if c.get("type") == "url"), None)
         if link:
@@ -157,6 +162,12 @@ def _module_line(m: dict) -> str:
     for d in m.get("dates") or []:
         parts.append(f"｜{d.get('label', '').rstrip(':：')} {fmt_time(d.get('timestamp'))}")
     return " ".join(parts)
+
+
+def _tabbed_status(content: TabbedContent) -> str:
+    if not content.complete:
+        return f"〔读取不完整〕{content.warning} 未找到课件不代表老师未上传。"
+    return f"读取来源：{content.source}；已读取全部 {len(content.tabs)} 个分页（含未选中的分页）。"
 
 
 @mcp.tool(title="课程大纲", annotations=READ)
@@ -180,8 +191,16 @@ async def course_outline(course: str, include_summaries: bool = False) -> str:
                         lines.append(f"{indent}  〔标签〕{clip(text, 800)}")
                 return
             lines.append(indent + _module_line(m))
+            if content := m.get("_tabbed"):
+                lines.append(f"{indent}  {_tabbed_status(content)}")
+                for tab in content.tabs:
+                    lines.append(f"{indent}  - 分页：{tab.title}")
+                    if include_summaries:
+                        lines.append(f"{indent}    {clip(html_to_text(tab.html), 1500)}")
+                for f in content.files:
+                    lines.append(f"{indent}    - {f['filename']}")
 
-        for index, (section, entries) in enumerate(section_tree(await moodle.contents(c.id))):
+        for index, (section, entries) in enumerate(section_tree(await moodle.material_contents(c.id))):
             summary = html_to_text(section.get("summary")) if include_summaries else ""
             if not entries and not summary:
                 continue
@@ -200,7 +219,7 @@ async def course_outline(course: str, include_summaries: bool = False) -> str:
 
 @mcp.tool(title="查找课件/活动", annotations=READ)
 async def find_materials(keyword: str, course: str | None = None) -> str:
-    """按关键词在课程活动名和文件名中搜索（如「week 3」「lecture 5」「handbook」）。
+    """按关键词在课程活动名、文件名和分页正文中搜索（如「week 3」「lecture 5」「handbook」）。
 
     Args:
         keyword: 关键词，不区分大小写；多个词用空格分隔，须全部命中
@@ -212,8 +231,9 @@ async def find_materials(keyword: str, course: str | None = None) -> str:
     with errors():
         moodle = await get_moodle()
         courses = await _courses_for(moodle, course)
-        all_contents = await asyncio.gather(*(moodle.contents(c.id) for c in courses))
+        all_contents = await asyncio.gather(*(moodle.material_contents(c.id) for c in courses))
         hits: list[str] = []
+        warnings: list[str] = []
         for c, sections in zip(courses, all_contents, strict=True):
             for section in sections:
                 for m in section.get("modules", []):
@@ -223,12 +243,25 @@ async def find_materials(keyword: str, course: str | None = None) -> str:
                         f.get("filename") or "" for f in m.get("contents") or [] if f.get("type") == "file"
                     ]
                     where = html.unescape(section.get("name") or "")
-                    hay = " ".join(names + [where]).lower()
+                    content = m.get("_tabbed")
+                    if content and not content.complete:
+                        warnings.append(f"{c.shortname}｜{where}｜cmid={m['id']}：{_tabbed_status(content)}")
+                    tab_text = " ".join(f"{t.title} {html_to_text(t.html)}" for t in content.tabs) if content else ""
+                    hay = " ".join(names + [where, tab_text]).lower()
                     if all(w in hay for w in words):
-                        hits.append(f"{c.shortname}｜{where}\n  {_module_line(m)}")
-        if not hits:
-            return f"没有找到包含「{keyword}」的活动或文件。"
-        return clip(f"找到 {len(hits)} 项：\n" + "\n".join(hits), 40_000)
+                        detail = f"{c.shortname}｜{where}\n  {_module_line(m)}"
+                        if content:
+                            detail += f"\n  {_tabbed_status(content)}"
+                            for tab in content.tabs:
+                                text = html_to_text(tab.html)
+                                if any(w in f"{tab.title} {text}".lower() for w in words):
+                                    detail += f"\n  分页 {tab.title}：{clip(text, 1200)}"
+                            detail += "".join(f"\n  - {f['filename']}" for f in content.files)
+                        hits.append(detail)
+        body = f"找到 {len(hits)} 项：\n" + "\n".join(hits) if hits else f"在已读取的活动和文件中没有找到包含「{keyword}」的项目。"
+        if warnings:
+            body = "## 搜索范围不完整\n" + "\n".join(warnings) + "\n\n" + body
+        return clip(body, 40_000)
 
 
 async def _book_text(moodle: Moodle, module: dict, limit: int) -> str:
@@ -250,7 +283,7 @@ async def _book_text(moodle: Moodle, module: dict, limit: int) -> str:
 
 @mcp.tool(title="读取活动内容", annotations=READ)
 async def read_activity(cmid: int, max_chars: int = 30_000) -> str:
-    """读取某个活动的正文：页面（page）、书（book）、标签、链接、作业要求、文件夹/资源文件列表等。
+    """读取活动正文：页面、书、分页内容（tabbedcontent）、标签、链接、作业要求和附件列表等。
 
     文件本身用 download_activity 下载后再用 read_local_file 读取文字。
 
@@ -272,7 +305,14 @@ async def read_activity(cmid: int, max_chars: int = 30_000) -> str:
         desc = html_to_text(module.get("description"))
         files = [c for c in module.get("contents") or [] if c.get("type") == "file"]
 
-        if modname == "page":
+        if modname == "tabbedcontent":
+            module = module or {"id": cmid}
+            content = (await moodle.tabbed_contents(course_id, [module]))[cmid]
+            lines.append(_tabbed_status(content))
+            for tab in content.tabs:
+                lines.append(f"\n## 分页：{tab.title}\n{html_to_text(tab.html) or '（该分页没有填写正文）'}")
+            files = content.files
+        elif modname == "page":
             pages = await moodle.by_courses("mod_page_get_pages_by_courses", "pages", course_id)
             page = next((p for p in pages if int(p.get("coursemodule", 0)) == cmid), {})
             intro = html_to_text(page.get("intro"))
@@ -308,13 +348,18 @@ async def read_activity(cmid: int, max_chars: int = 30_000) -> str:
             if desc:
                 lines.append(f"\n{desc}")
             lines.append("\n论坛帖子请用 announcements 或 list_discussions 查看。")
-        elif desc:
-            lines.append(f"\n## 说明\n{desc}")
+        else:
+            if desc:
+                lines.append(f"\n## 说明\n{desc}")
+            if modname not in {"resource", "folder", "label"}:
+                lines.append("\n〔读取不完整〕该活动类型尚未支持完整读取，仅显示简介和 API 提供的附件；不能据此判断内容不存在。")
 
         if files:
             lines.append(f"\n## 附件（{len(files)} 个，可用 download_activity 下载）")
             for f in files[:50]:
-                lines.append(f"- {f.get('filename')}（{fmt_size(f.get('filesize'))}，更新于 {fmt_time(f.get('timemodified'))}）")
+                size = fmt_size(f["filesize"]) if "filesize" in f else "大小未知"
+                modified = fmt_time(f["timemodified"]) if "timemodified" in f else "未知"
+                lines.append(f"- {f.get('filename')}（{size}，更新于 {modified}）")
         return clip("\n".join(lines), max_chars)
 
 
@@ -580,7 +625,7 @@ def _parse_types(types: str | None) -> set[str] | None:
 
 @mcp.tool(title="同步课件", annotations=LOCAL_WRITE)
 async def sync_files(course: str | None = None, types: str | None = None, dry_run: bool = False) -> str:
-    """把课程资源（resource/folder）里的文件增量下载到本地，只下载新增或更新的文件。
+    """把课程资源（resource/folder/tabbedcontent）里的文件增量下载到本地，只下载新增或更新的文件。
 
     保存位置：<下载根目录>/<课程名>/<序号 章节名>/<文件>。
 
@@ -600,7 +645,8 @@ async def sync_files(course: str | None = None, types: str | None = None, dry_ru
         reports = []
         for c in courses:
             reports.append(await sync_course(moodle, c, exts, dry_run))
-        head = "预览（未下载）" if dry_run else "同步完成"
+        incomplete = any(r.warnings for r in reports)
+        head = "预览（未下载）" if dry_run else ("同步结束（部分内容未读取）" if incomplete else "同步完成")
         new = sum(len(r.new) for r in reports)
         upd = sum(len(r.updated) for r in reports)
         failed = sum(len(r.failed) for r in reports)
@@ -635,9 +681,13 @@ async def download_activity(cmid: int, read: bool = False, pages: str | None = N
         if not paths:
             if report.failed:
                 return "下载失败：" + "；".join(f"{f.rel}：{e}" for f, e in report.failed)
+            if report.warnings:
+                return "〔读取不完整〕" + "；".join(report.warnings) + "不能据此判断该活动没有可下载文件。"
             return f"cmid={cmid}（{cm.get('modname')}）没有可下载的文件。"
         lines = [f"{html.unescape(cm.get('name') or '')}：{len(paths)} 个文件"]
         lines += [f"- {p}" for p in paths]
+        lines += [f"〔读取不完整〕{w}" for w in report.warnings]
+        lines += [f"[下载失败] {f.rel}：{err}" for f, err in report.failed]
         if read:
             for p in paths[:5]:
                 lines.append("\n" + await asyncio.to_thread(extract_text, p, pages, 40_000))

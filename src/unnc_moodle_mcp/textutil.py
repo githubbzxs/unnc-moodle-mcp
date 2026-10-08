@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from html.parser import HTMLParser
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .config import TZ
 
@@ -14,6 +15,17 @@ _BLOCK_TAGS = {
 }
 _SKIP_TAGS = {"script", "style", "noscript", "template"}
 _WEEKDAYS = "一二三四五六日"
+
+
+def public_url(url: str) -> str:
+    """移除链接中可用于认证的查询参数，不把 token 等值返回给 AI。"""
+    parsed = urlparse(url)
+    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query) if not any(
+        word in k.lower() for word in ("token", "secret", "key", "credential", "auth", "cookie", "password", "binding")
+    )])
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    fragment = "" if any(word in parsed.fragment.lower() for word in ("token=", "secret=", "key=")) else parsed.fragment
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, query, fragment))
 
 
 class _TextParser(HTMLParser):
@@ -37,7 +49,7 @@ class _TextParser(HTMLParser):
             self.parts.append("\n")
         elif tag == "a":
             href = dict(attrs).get("href") or ""
-            self._href = href if href.startswith(("http://", "https://", "mailto:")) else None
+            self._href = public_url(href) if href.startswith(("http://", "https://", "mailto:")) else None
             self._link_text = []
         elif tag == "img":
             alt = (dict(attrs).get("alt") or "").strip()
@@ -71,6 +83,7 @@ def html_to_text(html: str | None) -> str:
     parser.feed(html)
     parser.close()
     text = "".join(parser.parts).replace("\xa0", " ")
+    text = re.sub(r"(?:https?://|mailto:)[^\s<>）]+", lambda m: public_url(m.group()), text)
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     out: list[str] = []
     for line in lines:

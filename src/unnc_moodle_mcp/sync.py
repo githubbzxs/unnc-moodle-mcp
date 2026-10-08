@@ -14,12 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .api import Course, Moodle, section_tree
+from .client import MoodleError, TokenInvalid
 from .config import DOWNLOAD_DIR
 from .textutil import fmt_size, safe_name
 
 MANIFEST = ".moodle-sync.json"
 # 默认同步这些模块里的文件；page 模块的内嵌图片和 HTML 通常没有单独保存价值
-SYNC_MODULES = {"resource", "folder"}
+SYNC_MODULES = {"resource", "folder", "tabbedcontent"}
 CONCURRENCY = 4
 
 
@@ -33,6 +34,7 @@ class RemoteFile:
     section: str
     module: str
     cmid: int
+    metadata_known: bool = True
 
 
 @dataclass
@@ -45,6 +47,7 @@ class SyncReport:
     failed: list[tuple[RemoteFile, str]] = field(default_factory=list)
     dry_run: bool = False
     files: dict[str, Path] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     def local_paths(self) -> list[Path]:
         """本次涉及且已在本地的文件绝对路径（按清单记录的实际位置）。"""
@@ -68,11 +71,14 @@ class SyncReport:
         if changed:
             lines.append(f"{verb}：")
             for tag, f in changed[:show]:
-                lines.append(f"- [{tag}] {f.rel}（{fmt_size(f.size)}）")
+                size = fmt_size(f.size) if f.metadata_known else "大小或更新时间未知"
+                lines.append(f"- [{tag}] {f.rel}（{size}）")
             if len(changed) > show:
                 lines.append(f"- …另有 {len(changed) - show} 个")
         for f, err in self.failed[:10]:
             lines.append(f"- [失败] {f.rel}：{err}")
+        for warning in self.warnings:
+            lines.append(f"- [读取不完整] {warning}")
         return "\n".join(lines)
 
 
@@ -102,7 +108,7 @@ def plan_files(
             return
         items = [c for c in module.get("contents") or [] if c.get("type") == "file"]
         base = section_dir
-        if modname == "folder" or len(items) > 1:
+        if modname in {"folder", "tabbedcontent"} or len(items) > 1:
             base = section_dir / safe_name(html.unescape(module.get("name") or "folder"))
         for item in items:
             name = item.get("filename") or ""
@@ -120,7 +126,8 @@ def plan_files(
             files.append(
                 RemoteFile(
                     # 资源文件 URL 里含版本号，替换文件后会变；用 cmid+路径+文件名作稳定键
-                    key=f"{module.get('id')}:{item.get('filepath') or '/'}{name}",
+                    key=(f"{module.get('id')}:tabfile:{item['_file_key']}" if "_file_key" in item
+                         else f"{module.get('id')}:{item.get('filepath') or '/'}{name}"),
                     url=url,
                     rel=rel,
                     size=int(item.get("filesize") or 0),
@@ -128,6 +135,7 @@ def plan_files(
                     section=section_name,
                     module=html.unescape(module.get("name") or ""),
                     cmid=int(module.get("id") or 0),
+                    metadata_known=not item.get("_metadata_unknown", False),
                 )
             )
 
@@ -165,7 +173,8 @@ def _is_current(entry: dict | None, f: RemoteFile, root: Path) -> bool:
         return False
     local = root / entry.get("path", "")
     return (
-        entry.get("modified") == f.modified
+        f.metadata_known
+        and entry.get("modified") == f.modified
         and entry.get("size") == f.size
         and local.is_file()
         and local.stat().st_size == f.size
@@ -195,7 +204,28 @@ async def sync_course(
     """同步整门课；only_cmid 指定时只处理该活动（任意模块类型）里的文件。"""
     root = course_dir(course, base)
     report = SyncReport(course=course, root=root, dry_run=dry_run)
-    sections = await moodle.contents(course.id)
+    sections = await moodle.material_contents(course.id, only_cmid)
+    for section in sections:
+        for module in section.get("modules", []):
+            if only_cmid is not None and int(module["id"]) != only_cmid:
+                continue
+            if not module.get("uservisible", True) or (only_cmid is None and module.get("modname") not in SYNC_MODULES):
+                continue
+            content = module.get("_tabbed")
+            if content and not content.complete:
+                report.warnings.append(f"cmid={module['id']}：{content.warning} 未找到课件不代表老师未上传。")
+            for item in module.get("contents") or []:
+                if not item.get("_metadata_unknown") or not _match_ext(item.get("filename") or "", exts):
+                    continue
+                try:
+                    item.update(await moodle.client.file_metadata(item["fileurl"]))
+                    item["_metadata_unknown"] = not all(k in item for k in ("filesize", "timemodified"))
+                    if item["_metadata_unknown"]:
+                        report.warnings.append(f"{item.get('filename')}：响应头缺少大小或更新时间，下次同步将重新核验。")
+                except TokenInvalid:
+                    raise
+                except (MoodleError, ValueError):
+                    report.warnings.append(f"{item.get('filename')}：未取得文件元数据，仍会尝试下载，下次同步将重新核验。")
     if only_cmid is None:
         remote = plan_files(sections, exts)
     else:
@@ -215,7 +245,7 @@ async def sync_course(
         else:
             # 本地已有同名同大小文件（例如之前手动下载过）时直接登记，不重复下载
             local = root / f.rel
-            if f.size and local.is_file() and local.stat().st_size == f.size:
+            if f.metadata_known and f.size and local.is_file() and local.stat().st_size == f.size:
                 manifest[f.key] = {"path": f.rel.as_posix(), "modified": f.modified, "size": f.size}
                 owned.add(f.rel.as_posix())
                 report.unchanged += 1
@@ -239,7 +269,7 @@ async def sync_course(
                 await moodle.client.download(f.url, root / rel)
                 if f.modified:
                     os.utime(root / rel, (f.modified, f.modified))
-                manifest[f.key] = {"path": rel.as_posix(), "modified": f.modified, "size": f.size}
+                manifest[f.key] = {"path": rel.as_posix(), "modified": f.modified, "size": (root / rel).stat().st_size}
             except Exception as exc:  # noqa: BLE001 - 单个文件失败不影响整门课
                 report.failed.append((f, str(exc)))
 

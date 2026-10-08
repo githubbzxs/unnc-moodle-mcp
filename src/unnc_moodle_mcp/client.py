@@ -10,13 +10,15 @@ import asyncio
 import contextlib
 import json
 import os
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
 from .config import MOODLE_URL, USER_AGENT
+from .textutil import public_url
 
 REST_URL = f"{MOODLE_URL}/webservice/rest/server.php"
 RETRIES = 2
@@ -67,14 +69,15 @@ def ws_file_url(url: str) -> str:
     if url.startswith("/"):
         url = MOODLE_URL + url
     parsed = urlparse(url)
-    if parsed.netloc.lower() != urlparse(MOODLE_URL).netloc.lower():
+    base = urlparse(MOODLE_URL)
+    if parsed.netloc.lower() != base.netloc.lower() or parsed.scheme != base.scheme:
         raise ValueError(f"只允许下载 {MOODLE_URL} 上的文件：{display_url(url)}")
     path = parsed.path
     if "/webservice/pluginfile.php/" not in path:
         if "/pluginfile.php/" not in path:
             raise ValueError(f"不是 Moodle 文件地址（pluginfile.php）：{display_url(url)}")
         path = path.replace("/pluginfile.php/", "/webservice/pluginfile.php/", 1)
-    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query) if k != "token"])
+    query = urlparse(public_url(url)).query
     return urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
 
 
@@ -128,13 +131,52 @@ class MoodleClient:
         _check(data)
         return data
 
-    async def fetch_bytes(self, url: str, max_bytes: int = 5_000_000) -> bytes:
-        """把小文件（如 Book 章节 HTML）读入内存。"""
+    @contextlib.asynccontextmanager
+    async def _file_stream(self, url: str, metadata: bool = False):
+        """手动检查文件重定向，防止 307/308 把 POST token 转发到外站。"""
         target = ws_file_url(url)
-        try:
-            async with self._http.stream("POST", target, data={"token": self._token}) as resp:
+        for _ in range(6):
+            options = {"timeout": httpx.Timeout(20.0, connect=10.0), "headers": {"Connection": "close"}} if metadata else {}
+            async with self._http.stream("POST", target, data={"token": self._token}, follow_redirects=False, **options) as resp:
+                if resp.is_redirect:
+                    target = ws_file_url(urljoin(target, resp.headers.get("location") or ""))
+                    continue
                 if resp.status_code >= 400:
                     raise MoodleError("http", f"HTTP {resp.status_code}：{display_url(url)}")
+                yield resp
+                return
+        raise MoodleError("http", f"文件重定向次数过多：{display_url(url)}")
+
+    async def file_metadata(self, url: str) -> dict[str, int]:
+        """分页正文不提供文件大小和时间时，用文件响应头补齐，不下载正文。"""
+        for attempt in range(RETRIES + 1):
+            try:
+                async with self._file_stream(url, metadata=True) as resp:
+                    if "application/json" in resp.headers.get("content-type", ""):
+                        _check(json.loads(await resp.aread()))
+                        raise MoodleError("http", "文件元数据请求返回了 JSON，而不是文件")
+                    result = {}
+                    size = resp.headers.get("content-length", "")
+                    if size.isdigit() and not resp.headers.get("content-encoding"):
+                        result["filesize"] = int(size)
+                    modified = resp.headers.get("last-modified")
+                    if modified:
+                        with contextlib.suppress(ValueError, TypeError, OverflowError):
+                            result["timemodified"] = int(parsedate_to_datetime(modified).timestamp())
+                    return result
+            except httpx.TransportError as exc:
+                if attempt < RETRIES:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                raise MoodleError("http", f"读取文件元数据失败：{type(exc).__name__}") from None
+            except httpx.HTTPError as exc:
+                raise MoodleError("http", f"读取文件元数据失败：{type(exc).__name__}") from None
+        raise AssertionError("文件元数据重试未返回结果")
+
+    async def fetch_bytes(self, url: str, max_bytes: int = 5_000_000) -> bytes:
+        """把小文件（如 Book 章节 HTML）读入内存。"""
+        try:
+            async with self._file_stream(url) as resp:
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in resp.aiter_bytes():
@@ -152,13 +194,11 @@ class MoodleClient:
 
     async def download(self, url: str, dest: Path) -> int:
         """下载文件到 dest（先写 .part 再原子替换），返回字节数。"""
-        target = ws_file_url(url)
+        ws_file_url(url)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
         try:
-            async with self._http.stream("POST", target, data={"token": self._token}) as resp:
-                if resp.status_code >= 400:
-                    raise MoodleError("http", f"HTTP {resp.status_code}：{display_url(url)}")
+            async with self._file_stream(url) as resp:
                 if "application/json" in resp.headers.get("content-type", ""):
                     body = await resp.aread()
                     try:

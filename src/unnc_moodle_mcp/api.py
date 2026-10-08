@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import html
 import json
 import re
@@ -10,7 +11,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .client import MoodleClient
+from .client import MoodleClient, MoodleError, TokenInvalid
+from .ego import EgoReader, EgoUnavailable
+from .tabbed import TabbedContent, parse_mobile_content
 
 # 各类数据的缓存秒数：课程结构变化慢，通知与截止时间需要较新
 TTL_COURSES = 3600
@@ -79,6 +82,8 @@ class Moodle:
         self.userid = userid
         self._cache: dict[str, tuple[float, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._ego_reader = EgoReader(userid)
+        self._mobile_retry_after = 0.0
 
     async def call(self, ttl: int, function: str, **args: Any) -> Any:
         key = function + json.dumps(args, sort_keys=True, default=str)
@@ -166,6 +171,81 @@ class Moodle:
 
     async def contents(self, course_id: int) -> list[dict]:
         return await self.call(TTL_CONTENTS, "core_course_get_contents", courseid=course_id)
+
+    async def _mobile_tabbed(self, course_id: int, cmid: int) -> TabbedContent:
+        plugins = await self.call(TTL_COURSES, "tool_mobile_get_plugins_supporting_mobile")
+        plugin = next((p for p in plugins.get("plugins", []) if p.get("component") == "mod_tabbedcontent"), {})
+        handlers = json.loads(plugin.get("handlers") or "{}")
+        handler = next((h for h in handlers.values() if h.get("delegate") == "CoreCourseModuleDelegate"), {})
+        if not handler.get("method"):
+            raise ValueError("插件未注册移动端内容接口")
+        args = {"cmid": cmid, "courseid": course_id, "userid": self.userid, "appversioncode": 50000, "applang": "en"}
+        data = await self.call(
+            TTL_ACTIVITY, "tool_mobile_get_content", component="mod_tabbedcontent", method=handler["method"],
+            args=[{"name": key, "value": str(value)} for key, value in args.items()],
+        )
+        return parse_mobile_content(data)
+
+    async def tabbed_contents(self, course_id: int, modules: list[dict]) -> dict[int, TabbedContent]:
+        """API 优先；插件接口故障时一次读取课程页中全部需要的分页活动。"""
+        key = f"tabbed:{course_id}"
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            result: dict[int, TabbedContent] = {}
+            pending = []
+            for module in modules:
+                cmid = int(module["id"])
+                hit = self._cache.get(f"tabbed:{course_id}:{cmid}")
+                if hit and hit[0] > time.monotonic():
+                    result[cmid] = hit[1]
+                elif not module.get("uservisible", True):
+                    result[cmid] = TabbedContent(complete=False, warning="当前用户暂不可访问该活动。")
+                else:
+                    pending.append(cmid)
+            fallback = []
+            for cmid in pending:
+                if time.monotonic() < self._mobile_retry_after:
+                    fallback.append(cmid)
+                    continue
+                try:
+                    result[cmid] = await self._mobile_tabbed(course_id, cmid)
+                except TokenInvalid:
+                    raise
+                except (MoodleError, ValueError, TypeError, KeyError):
+                    self._mobile_retry_after = time.monotonic() + TTL_ACTIVITY
+                    fallback.append(cmid)
+            if fallback:
+                try:
+                    browser = await self._ego_reader.read_course(course_id, fallback)
+                    for cmid in fallback:
+                        result[cmid] = browser.get(cmid) or TabbedContent(
+                            complete=False, warning="课程页中未找到该分页活动，可能暂不可访问或渲染结构已改变。",
+                        )
+                except EgoUnavailable as exc:
+                    for cmid in fallback:
+                        result[cmid] = TabbedContent(complete=False, warning=str(exc))
+            for cmid in pending:
+                item = result[cmid]
+                # 完整的空分页可缓存；读取失败只短暂缓存，避免长期掩盖恢复后的内容。
+                ttl = TTL_ACTIVITY if item.complete else TTL_LIVE
+                self._cache[f"tabbed:{course_id}:{cmid}"] = (time.monotonic() + ttl, item)
+            return result
+
+    async def material_contents(self, course_id: int, only_cmid: int | None = None) -> list[dict]:
+        """为课件搜索、下载和大纲补齐分页正文与文件，不修改原始 API 缓存。"""
+        sections = copy.deepcopy(await self.contents(course_id))
+        modules = [
+            m for section in sections for m in section.get("modules", [])
+            if m.get("modname") == "tabbedcontent" and (only_cmid is None or int(m["id"]) == only_cmid)
+        ]
+        if not modules:
+            return sections
+        contents = await self.tabbed_contents(course_id, modules)
+        for module in modules:
+            content = copy.deepcopy(contents[int(module["id"])])
+            module["_tabbed"] = content
+            known = {f.get("fileurl") for f in module.get("contents") or []}
+            module["contents"] = list(module.get("contents") or []) + [f for f in content.files if f["fileurl"] not in known]
+        return sections
 
     async def course_module(self, cmid: int) -> dict:
         data = await self.call(TTL_CONTENTS, "core_course_get_course_module", cmid=cmid)
